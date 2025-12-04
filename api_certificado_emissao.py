@@ -6,26 +6,31 @@ import re
 import base64
 import tempfile
 import os
+from typing import Optional
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
 app = FastAPI(
-    title="API Extrator NFS-e por Data de Emissão",
-    description="API para extração de faturamento por data de emissão (não por competência)",
-    version="1.0.0"
+    title="API Extrator NFS-e com Paginação (Data de Emissão)",
+    description="API para extração de faturamento página por página filtrando por DATA DE EMISSÃO",
+    version="2.0.0"
 )
 
-class FaturamentoRequestEmissao(BaseModel):
+class FaturamentoRequestPaginadoEmissao(BaseModel):
     certificado_base64: str = Field(..., description="Certificado A1 em base64")
     senha_certificado: str = Field(..., description="Senha do certificado")
     ano: str = Field(..., description="Ano de emissão (ex: 2025)", pattern=r"^\d{4}$")
+    pagina: int = Field(..., description="Número da página a processar (começa em 1)", ge=1)
 
-class FaturamentoResponse(BaseModel):
+class FaturamentoResponsePaginadoEmissao(BaseModel):
     CNPJ: str
-    Faturamento: float
-    Notas_Encontradas: int
-    Ano_Emissao: str
+    Pagina: int
+    Faturamento_Pagina: float
+    Notas_Pagina: int
+    Tem_Proxima_Pagina: bool
+    Motivo_Parada: Optional[str] = None
+    Ano_Emissao_Filtro: str
 
 def fazer_login_certificado(certificado_base64, senha_certificado):
     """Realiza login com certificado A1 e retorna sessão autenticada"""
@@ -117,28 +122,29 @@ def limpar_arquivos_temporarios(session):
     except:
         pass
 
-def processar_pagina_por_emissao(soup, ano_filtro):
-    """Processa uma página de notas filtrando por DATA DE EMISSÃO (não competência)"""
+def processar_pagina_unica_emissao(soup, ano_filtro):
+    """Processa UMA ÚNICA página de notas filtrando por DATA DE EMISSÃO"""
     faturamento_pagina = 0.0
     notas_na_pagina = 0
-    continuar = True
+    tem_proxima = True
+    motivo_parada = None
     
     tbody = soup.find('tbody')
     if not tbody:
-        return 0.0, 0, False
+        return 0.0, 0, False, "Nenhuma nota encontrada na página"
     
     linhas = tbody.find_all('tr')
     if not linhas:
-        return 0.0, 0, False
+        return 0.0, 0, False, "Nenhuma nota encontrada na página"
     
     for linha in linhas:
         try:
-            # Verifica se está emitida (status)
+            # Verifica se está emitida
             img_gerada = linha.find('img', src='/EmissorNacional/img/tb-gerada.svg')
             if not img_gerada:
                 continue
             
-            # MUDANÇA PRINCIPAL: Agora usa a coluna de DATA DE EMISSÃO ao invés de COMPETÊNCIA
+            # Extrai DATA DE EMISSÃO (não competência)
             td_data_emissao = linha.find('td', class_='td-data')
             if not td_data_emissao:
                 continue
@@ -154,9 +160,10 @@ def processar_pagina_por_emissao(soup, ano_filtro):
             mes = match.group(2)
             ano_emissao = match.group(3)
             
-            # Se o ano de emissão é menor que o solicitado, para de buscar
+            # Se encontrou emissão de ano MENOR que o solicitado, PARA
             if int(ano_emissao) < int(ano_filtro):
-                continuar = False
+                tem_proxima = False
+                motivo_parada = f"Encontrou emissão de ano anterior ({ano_emissao})"
                 break
             
             # Se o ano de emissão é maior que o solicitado, pula
@@ -175,65 +182,75 @@ def processar_pagina_por_emissao(soup, ano_filtro):
             
             faturamento_pagina += valor
             notas_na_pagina += 1
-        except:
+            
+        except Exception:
             continue
     
-    return faturamento_pagina, notas_na_pagina, continuar
+    # Se não encontrou nenhuma nota na página, provavelmente acabou
+    if notas_na_pagina == 0 and tem_proxima:
+        tem_proxima = False
+        motivo_parada = "Página vazia ou sem notas válidas"
+    
+    return faturamento_pagina, notas_na_pagina, tem_proxima, motivo_parada
 
-def buscar_notas_por_emissao(session, ano):
-    """Busca e processa todas as notas fiscais por DATA DE EMISSÃO"""
-    faturamento_total = 0.0
-    notas_processadas = 0
-    pagina = 1
-    continuar = True
+def buscar_pagina_especifica_emissao(session, pagina, ano):
+    """Busca UMA página específica de notas por data de emissão"""
     url_base = "https://www.nfse.gov.br/EmissorNacional/Notas/Emitidas"
     
-    while continuar:
-        url = url_base if pagina == 1 else f"{url_base}?pg={pagina}"
-        response = session.get(url, timeout=30)
-        if response.status_code != 200:
-            break
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        faturamento_pagina, notas_pagina, continuar = processar_pagina_por_emissao(soup, ano)
-        
-        faturamento_total += faturamento_pagina
-        notas_processadas += notas_pagina
-        
-        if not continuar:
-            break
-        
-        paginacao = soup.find('div', class_='paginacao')
-        if not paginacao:
-            break
-        
-        link_proxima = paginacao.find('a', title='Próxima')
-        if not link_proxima or 'javascript:' in link_proxima.get('href', ''):
-            break
-        
-        pagina += 1
+    # Monta URL da página
+    url = url_base if pagina == 1 else f"{url_base}?pg={pagina}"
     
-    return faturamento_total, notas_processadas
+    response = session.get(url, timeout=30)
+    
+    if response.status_code != 200:
+        return 0.0, 0, False, f"Erro ao acessar página {pagina}"
+    
+    soup = BeautifulSoup(response.text, 'html.parser')
+    
+    # Processa a página
+    faturamento, quantidade, tem_proxima, motivo = processar_pagina_unica_emissao(soup, ano)
+    
+    return faturamento, quantidade, tem_proxima, motivo
 
 @app.get("/")
 def read_root():
     return {
         "status": "ok", 
-        "message": "API Extrator NFS-e por Data de Emissão online",
-        "docs": "/docs"
+        "message": "API Extrator NFS-e com Paginação (Data de Emissão) online",
+        "docs": "/docs",
+        "versao": "2.0.0"
     }
 
-@app.post("/api/faturamento-emissao", response_model=FaturamentoResponse)
-def obter_faturamento_por_emissao(request: FaturamentoRequestEmissao):
+@app.post("/api/faturamento-paginado-emissao", response_model=FaturamentoResponsePaginadoEmissao)
+def obter_faturamento_paginado_emissao(request: FaturamentoRequestPaginadoEmissao):
     """
-    Extrai o faturamento de NFS-e filtrando por DATA DE EMISSÃO (não por competência)
+    Extrai o faturamento de UMA PÁGINA ESPECÍFICA de NFS-e filtrando por DATA DE EMISSÃO
     
     - **certificado_base64**: Arquivo .pfx ou .p12 convertido em base64
     - **senha_certificado**: Senha do certificado digital
     - **ano**: Ano de EMISSÃO da nota (formato YYYY)
+    - **pagina**: Número da página a processar (começa em 1)
     
-    IMPORTANTE: Este endpoint considera a DATA DE EMISSÃO da nota, não a competência!
-    Exemplo: Nota emitida em 02/01/2025 com competência 12/2024 SERÁ CONSIDERADA no ano 2025.
+    IMPORTANTE: 
+    - Este endpoint processa APENAS UMA PÁGINA por vez
+    - Filtra por DATA DE EMISSÃO (não por competência)
+    - Para automaticamente ao encontrar emissão de ano anterior
+    - Use em loop no N8N para processar todas as páginas
+    - REGRA DE EXCEÇÃO: Considera emissão, não competência
+    
+    Exemplo: Nota emitida em 02/01/2025 com competência 12/2024 SERÁ CONSIDERADA no ano 2025
+    
+    Exemplo de uso no N8N:
+    let total = 0;
+    let pagina = 1;
+    let continuar = true;
+    
+    while (continuar) {
+      response = await chamarAPI(pagina);
+      total += response.Faturamento_Pagina;
+      continuar = response.Tem_Proxima_Pagina;
+      pagina++;
+    }
     """
     session = None
     
@@ -247,17 +264,24 @@ def obter_faturamento_por_emissao(request: FaturamentoRequestEmissao):
         if not cnpj:
             cnpj = "Não identificado"
         
-        # Busca as notas por data de emissão
-        faturamento, quantidade = buscar_notas_por_emissao(session, request.ano)
+        # Busca a página específica por data de emissão
+        faturamento, quantidade, tem_proxima, motivo = buscar_pagina_especifica_emissao(
+            session, 
+            request.pagina, 
+            request.ano
+        )
         
         # Limpa arquivos temporários
         limpar_arquivos_temporarios(session)
         
-        return FaturamentoResponse(
+        return FaturamentoResponsePaginadoEmissao(
             CNPJ=cnpj,
-            Faturamento=round(faturamento, 2),
-            Notas_Encontradas=quantidade,
-            Ano_Emissao=request.ano
+            Pagina=request.pagina,
+            Faturamento_Pagina=round(faturamento, 2),
+            Notas_Pagina=quantidade,
+            Tem_Proxima_Pagina=tem_proxima,
+            Motivo_Parada=motivo,
+            Ano_Emissao_Filtro=request.ano
         )
         
     except Exception as e:
@@ -270,4 +294,4 @@ def obter_faturamento_por_emissao(request: FaturamentoRequestEmissao):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8003)
