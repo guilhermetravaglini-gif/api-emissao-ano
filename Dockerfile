@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements_certificado.txt .
 RUN pip install --no-cache-dir -r requirements_certificado.txt
 
-COPY api_certificado.py .
+COPY api_certificado_emissao.py .
 
 EXPOSE 8000
 
